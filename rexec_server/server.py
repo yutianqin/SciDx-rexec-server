@@ -1,4 +1,5 @@
 import logging
+import os
 import zmq
 import dill
 import dxspaces
@@ -10,7 +11,13 @@ class RExecServer:
     def __init__(self, args):
         self.zmq_addr = "tcp://" + args.broker_addr + ":" + args.broker_port
         self.zmq_context = zmq.Context()
-        self.zmq_socket = self.zmq_context.socket(zmq.REP)
+        self.zmq_socket = self.zmq_context.socket(zmq.DEALER)
+        user_id = os.environ.get("REXEC_USER_ID")
+        if user_id:
+            self.zmq_socket.setsockopt(zmq.IDENTITY, user_id.encode("utf-8"))
+            logging.info("Set server identity to %s", user_id)
+        else:
+            logging.warning("REXEC_USER_ID not set; server identity will be random.")
         self.zmq_socket.connect(self.zmq_addr)
         logging.info(f"Connected to {self.zmq_addr}")
         
@@ -19,21 +26,58 @@ class RExecServer:
             logging.info("Connected to DataSpaces API.")
             rexec.remote_obj.DSDataObj.dspaces_client = dspaces_client
     
+    @staticmethod
+    def _summarize_value(value, max_len=200):
+        try:
+            rep = repr(value)
+        except Exception:
+            rep = "<unreprable>"
+        if len(rep) > max_len:
+            rep = rep[:max_len - 3] + "..."
+        return f"{type(value).__name__}: {rep}"
+
+    @staticmethod
+    def _split_envelope(frames):
+        for idx, frame in enumerate(frames):
+            if frame == b"":
+                envelope = frames[:idx]
+                body = frames[idx + 1:]
+                return envelope, idx, body
+        return [], None, frames
+
+
     def fn_recv_exec(self):
         while(True):
             zmq_msg = self.zmq_socket.recv_multipart()
-            fn = dill.loads(zmq_msg[0])
+            envelope, _delimiter_index, body = self._split_envelope(zmq_msg)
+            if len(body) < 2:
+                logging.error("Invalid request framing: %s", zmq_msg)
+                ret = "Invalid request framing."
+                pret = dill.dumps(ret)
+                if envelope:
+                    self.zmq_socket.send_multipart(envelope + [b""] + [pret])
+                else:
+                    self.zmq_socket.send(pret)
+                continue
 
-            args = dill.loads(zmq_msg[1])
+            fn = dill.loads(body[0])
+            args = dill.loads(body[1])
+            fn_name = getattr(fn, "__name__", repr(fn))
+            logging.info("Received function: %s ;with %d args", fn_name, len(args))
 
             try:
                 ret = fn(*args)
             except Exception as e:
+                logging.exception("Function %s raised an exception", fn_name)
                 ret = f"An unexpected error occurred: {e}"
 
+            logging.info("Returning from %s -> %s", fn_name, self._summarize_value(ret))
             pret = dill.dumps(ret)
 
-            self.zmq_socket.send(pret)
+            if envelope:
+                self.zmq_socket.send_multipart(envelope + [b""] + [pret])
+            else:
+                self.zmq_socket.send(pret)
 
     def run(self):
         try:
