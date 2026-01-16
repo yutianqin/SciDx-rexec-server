@@ -12,12 +12,17 @@ class RExecServer:
         self.zmq_addr = "tcp://" + args.broker_addr + ":" + args.broker_port
         self.zmq_context = zmq.Context()
         self.zmq_socket = self.zmq_context.socket(zmq.DEALER)
-        user_id = os.environ.get("REXEC_USER_ID")
+
+        # Set server identity from server container's env var
+        user_id = os.environ.get("REXEC_USER_ID") # env var for server identity; set during deployment
         if user_id:
+            # set zmq.DEALER socket identity
             self.zmq_socket.setsockopt(zmq.IDENTITY, user_id.encode("utf-8"))
             logging.info("Set server identity to %s", user_id)
         else:
             logging.warning("REXEC_USER_ID not set; server identity will be random.")
+        
+        # Connect to broker and report its identity
         self.zmq_socket.connect(self.zmq_addr)
         logging.info(f"Connected to {self.zmq_addr}")
         
@@ -25,7 +30,7 @@ class RExecServer:
             dspaces_client = dxspaces.DXSpacesClient(args.dspaces_api_addr)
             logging.info("Connected to DataSpaces API.")
             rexec.remote_obj.DSDataObj.dspaces_client = dspaces_client
-    
+
     @staticmethod
     def _summarize_value(value, max_len=200):
         try:
@@ -44,12 +49,14 @@ class RExecServer:
                 body = frames[idx + 1:]
                 return envelope, idx, body
         return [], None, frames
-
-
+    
     def fn_recv_exec(self):
         while(True):
             zmq_msg = self.zmq_socket.recv_multipart()
+
+            # received zmq_msg: envelope(client_id) + b"" + body(pfn, pargs)
             envelope, _delimiter_index, body = self._split_envelope(zmq_msg)
+            # Logging and validation: body should have at least 2 frames: pfn, pargs(function and arg)
             if len(body) < 2:
                 logging.error("Invalid request framing: %s", zmq_msg)
                 ret = "Invalid request framing."
@@ -66,12 +73,15 @@ class RExecServer:
             logging.info("Received function: %s ;with %d args", fn_name, len(args))
 
             try:
+                # Execute received func
                 ret = fn(*args)
             except Exception as e:
                 logging.exception("Function %s raised an exception", fn_name)
                 ret = f"An unexpected error occurred: {e}"
 
             logging.info("Returning from %s -> %s", fn_name, self._summarize_value(ret))
+            
+            # Serialize return value
             pret = dill.dumps(ret)
 
             if envelope:
